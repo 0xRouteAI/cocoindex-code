@@ -43,3 +43,10 @@ htmlcov/
 
 # CocoIndex
 .cocoindex_code/
+target/
+node_modules/
+.mcp.json
+*.pyc
+.env
+.env.*
+!.env.example
