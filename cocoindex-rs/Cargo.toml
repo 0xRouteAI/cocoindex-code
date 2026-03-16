@@ -1,7 +1,10 @@
 [package]
-name = "coco-rs"
+name = "cocoindex-code-rs"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "coco_rs"
 
 [dependencies]
 # 核心引擎依赖 (本地路径)
@@ -31,6 +34,7 @@ md5 = "0.7"
 walkdir = "2.5"
 globset = "0.4"
 dirs = "5.0"
+notify = "6.1"
 
 [dev-dependencies]
 tempfile = "3.8"

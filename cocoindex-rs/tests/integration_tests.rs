@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use std::fs;
-use coco_rs::{Store, Provider, Indexer, config::{Config, ProjectSettings}};
+use std::process::Command;
+use coco_rs::{Store, Provider, config::Config};
 use std::sync::Arc;
 
 // Helper to create a test project
@@ -38,6 +39,12 @@ fn create_test_config(project_path: &PathBuf) -> Config {
     }
 }
 
+fn write_project_marker(project_root: &Path) {
+    let config_dir = project_root.join(".cocoindex_code");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("settings.yml"), "include_patterns: []\n").unwrap();
+}
+
 #[tokio::test]
 async fn test_deleted_file_cleanup() {
     // Test: 删除文件后搜索不应返回旧结果
@@ -51,8 +58,6 @@ async fn test_deleted_file_cleanup() {
     assert!(project_path.join("src/lib.rs").exists());
 
     // Get all indexed files before deletion
-    let files_before = store.get_all_indexed_files().await.unwrap();
-
     // Delete src/lib.rs
     fs::remove_file(project_path.join("src/lib.rs")).unwrap();
     assert!(!project_path.join("src/lib.rs").exists());
@@ -171,10 +176,300 @@ async fn test_provider_http_error() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_provider_batches_by_item_count_and_char_budget() {
+    let texts = vec![
+        "a".repeat(10),
+        "b".repeat(10),
+        "c".repeat(10),
+        "d".repeat(10),
+        "e".repeat(10),
+    ];
+
+    let batches = coco_rs::provider::plan_embedding_batches(&texts, 2, 25);
+
+    assert_eq!(batches, vec![(0, 2), (2, 4), (4, 5)]);
+}
+
+#[test]
+fn test_provider_batches_large_single_item_alone() {
+    let texts = vec![
+        "a".repeat(10),
+        "b".repeat(80),
+        "c".repeat(10),
+    ];
+
+    let batches = coco_rs::provider::plan_embedding_batches(&texts, 4, 32);
+
+    assert_eq!(batches, vec![(0, 1), (1, 2), (2, 3)]);
+}
+
+#[test]
+fn test_provider_reduces_chunk_size_for_short_context_models() {
+    let config = Config {
+        api_key: "test-key".to_string(),
+        api_base: "mock://embedding".to_string(),
+        model: "BAAI/bge-large-zh-v1.5".to_string(),
+        embedding_dim: 1024,
+        db_path: "/tmp/test.db".to_string(),
+    };
+
+    let provider = Provider::new(&config);
+    let chunking = provider.chunking_profile();
+
+    assert!(chunking.chunk_size < 2000);
+    assert!(chunking.chunk_overlap < chunking.chunk_size);
+}
+
+#[test]
+fn test_find_project_root_from_nested_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    let nested = project_root.join("src/lib");
+    fs::create_dir_all(&nested).unwrap();
+    write_project_marker(&project_root);
+
+    let resolved = coco_rs::project::find_project_root(&nested);
+
+    assert_eq!(resolved.as_deref(), Some(project_root.as_path()));
+}
+
+#[test]
+fn test_project_db_path_is_scoped_to_project_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    fs::create_dir_all(&project_root).unwrap();
+
+    let db_path = coco_rs::project::project_db_path(&project_root);
+
+    assert_eq!(db_path, project_root.join(".cocoindex_code/target_sqlite.db"));
+}
+
+#[test]
+fn test_default_path_filter_for_nested_directory() {
+    let project_root = Path::new("/tmp/demo");
+    let cwd = Path::new("/tmp/demo/src/module");
+
+    let filter = coco_rs::project::default_path_filter(project_root, cwd);
+
+    assert_eq!(filter.as_deref(), Some("src/module/*"));
+}
+
+#[test]
+fn test_scoped_chunk_ids_do_not_collide_across_projects() {
+    let left = Path::new("/tmp/project-a");
+    let right = Path::new("/tmp/project-b");
+
+    let left_id = coco_rs::project::scoped_chunk_id(left, "src/main.rs", 0);
+    let right_id = coco_rs::project::scoped_chunk_id(right, "src/main.rs", 0);
+
+    assert_ne!(left_id, right_id);
+}
+
+#[tokio::test]
+async fn test_store_creates_missing_parent_directories() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    let db_path = project_root.join(".cocoindex_code/target_sqlite.db");
+
+    let config = Config {
+        api_key: "test-key".to_string(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "text-embedding-3-small".to_string(),
+        embedding_dim: 1536,
+        db_path: db_path.to_string_lossy().to_string(),
+    };
+
+    let _store = Store::new(&config).await.unwrap();
+
+    assert!(db_path.exists());
+}
+
+#[tokio::test]
+async fn test_project_scoped_stores_do_not_mix_results() {
+    let left_dir = TempDir::new().unwrap();
+    let right_dir = TempDir::new().unwrap();
+    let left_root = left_dir.path().join("project-a");
+    let right_root = right_dir.path().join("project-b");
+    fs::create_dir_all(&left_root).unwrap();
+    fs::create_dir_all(&right_root).unwrap();
+
+    let left_config = Config {
+        api_key: "test-key".to_string(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "text-embedding-3-small".to_string(),
+        embedding_dim: 3,
+        db_path: left_root
+            .join(".cache/left/target_sqlite.db")
+            .to_string_lossy()
+            .to_string(),
+    };
+    let right_config = Config {
+        api_key: "test-key".to_string(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "text-embedding-3-small".to_string(),
+        embedding_dim: 3,
+        db_path: right_root
+            .join(".cache/right/target_sqlite.db")
+            .to_string_lossy()
+            .to_string(),
+    };
+
+    let left_store = Store::new(&left_config).await.unwrap();
+    let right_store = Store::new(&right_config).await.unwrap();
+
+    left_store.save_chunk(
+        &coco_rs::project::scoped_chunk_id(&left_root, "src/main.rs", 0),
+        "src/main.rs",
+        Some("rust"),
+        1,
+        1,
+        "hash-a",
+        &[0.0, 0.0, 0.0],
+    ).await.unwrap();
+
+    right_store.save_chunk(
+        &coco_rs::project::scoped_chunk_id(&right_root, "src/main.rs", 0),
+        "src/main.rs",
+        Some("rust"),
+        1,
+        1,
+        "hash-b",
+        &[10.0, 10.0, 10.0],
+    ).await.unwrap();
+
+    let left_results = left_store.search(&[0.0, 0.0, 0.0], 10, 0, None, None).await.unwrap();
+    let right_results = right_store.search(&[10.0, 10.0, 10.0], 10, 0, None, None).await.unwrap();
+
+    assert_eq!(left_results.len(), 1);
+    assert_eq!(right_results.len(), 1);
+    assert_eq!(left_results[0].file_path, "src/main.rs");
+    assert_eq!(right_results[0].file_path, "src/main.rs");
+}
+
+#[test]
+fn test_cli_help_succeeds() {
+    let binary = env!("CARGO_BIN_EXE_cocoindex-code-rs");
+    let output = Command::new(binary).arg("--help").output().unwrap();
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn test_cli_index_and_search_with_mock_embeddings() {
+    let project_dir = TempDir::new().unwrap();
+    let project_root = project_dir.path().join("project");
+    fs::create_dir_all(project_root.join("src")).unwrap();
+    fs::write(
+        project_root.join("src/main.rs"),
+        "fn authentication_logic() -> bool { true }\n",
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_cocoindex-code-rs");
+    let runtime_dir = project_dir.path().join("runtime");
+    let common_envs = [
+        ("OPENAI_API_BASE", "mock://embedding".to_string()),
+        ("OPENAI_API_KEY", "test-key".to_string()),
+        ("EMBEDDING_MODEL", "mock-model".to_string()),
+        ("EMBEDDING_DIM", "16".to_string()),
+        ("COCOINDEX_CODE_DIR", runtime_dir.to_string_lossy().to_string()),
+    ];
+
+    let index_output = Command::new(binary)
+        .envs(common_envs.clone())
+        .arg("index")
+        .arg(&project_root)
+        .output()
+        .unwrap();
+    assert!(index_output.status.success(), "stderr: {}", String::from_utf8_lossy(&index_output.stderr));
+
+    let search_output = Command::new(binary)
+        .envs(common_envs)
+        .arg("search")
+        .arg("authentication")
+        .arg("--project-root")
+        .arg(&project_root)
+        .output()
+        .unwrap();
+    assert!(search_output.status.success(), "stderr: {}", String::from_utf8_lossy(&search_output.stderr));
+    let stdout = String::from_utf8_lossy(&search_output.stdout);
+    assert!(stdout.contains("src/main.rs"));
+}
+
+#[test]
+fn test_status_does_not_create_database() {
+    let project_dir = TempDir::new().unwrap();
+    let project_root = project_dir.path().join("project");
+    fs::create_dir_all(&project_root).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_cocoindex-code-rs");
+    let runtime_dir = project_dir.path().join("runtime");
+    let common_envs = [
+        ("OPENAI_API_BASE", "mock://embedding".to_string()),
+        ("OPENAI_API_KEY", "test-key".to_string()),
+        ("EMBEDDING_MODEL", "mock-model".to_string()),
+        ("EMBEDDING_DIM", "16".to_string()),
+        ("COCOINDEX_CODE_DIR", runtime_dir.to_string_lossy().to_string()),
+    ];
+
+    let status_output = Command::new(binary)
+        .envs(common_envs.clone())
+        .arg("status")
+        .arg("--project-root")
+        .arg(&project_root)
+        .output()
+        .unwrap();
+    assert!(status_output.status.success(), "stderr: {}", String::from_utf8_lossy(&status_output.stderr));
+
+    assert!(!project_root.join(".cocoindex_code/target_sqlite.db").exists());
+    assert!(!status_output.stdout.is_empty());
+}
+
+#[test]
+fn test_cli_search_defaults_to_current_subdirectory() {
+    let project_dir = TempDir::new().unwrap();
+    let project_root = project_dir.path().join("project");
+    fs::create_dir_all(project_root.join("src/feature")).unwrap();
+    fs::create_dir_all(project_root.join("src/other")).unwrap();
+    fs::write(
+        project_root.join("src/feature/main.rs"),
+        "fn feature_authentication() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("src/other/main.rs"),
+        "fn other_authentication() -> bool { true }\n",
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_cocoindex-code-rs");
+    let runtime_dir = project_dir.path().join("runtime");
+    let common_envs = [
+        ("OPENAI_API_BASE", "mock://embedding".to_string()),
+        ("OPENAI_API_KEY", "test-key".to_string()),
+        ("EMBEDDING_MODEL", "mock-model".to_string()),
+        ("EMBEDDING_DIM", "16".to_string()),
+        ("COCOINDEX_CODE_DIR", runtime_dir.to_string_lossy().to_string()),
+    ];
+
+    let search_output = Command::new(binary)
+        .envs(common_envs)
+        .current_dir(project_root.join("src/feature"))
+        .arg("search")
+        .arg("feature_authentication")
+        .arg("--project-root")
+        .arg(&project_root)
+        .output()
+        .unwrap();
+    assert!(search_output.status.success(), "stderr: {}", String::from_utf8_lossy(&search_output.stderr));
+    let stdout = String::from_utf8_lossy(&search_output.stdout);
+    assert!(stdout.contains("src/feature/main.rs"));
+    assert!(!stdout.contains("src/other/main.rs"));
+}
+
 #[cfg(test)]
 mod mcp_tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use serde_json::json;
 
     #[tokio::test]
@@ -206,11 +501,11 @@ mod mcp_tests {
     async fn test_mcp_tools_list() {
         // Test: tools/list 返回正确的工具定义
 
-        let expected_tools = vec!["index_project", "search_code"];
+        let expected_tools = vec!["index_project", "search_code", "project_status"];
 
         // Verify tool names
         for tool in expected_tools {
-            assert!(tool == "index_project" || tool == "search_code");
+            assert!(tool == "index_project" || tool == "search_code" || tool == "project_status");
         }
     }
 

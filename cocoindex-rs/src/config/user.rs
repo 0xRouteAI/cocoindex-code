@@ -22,6 +22,16 @@ fn default_embedding_dim() -> usize {
 }
 
 impl UserSettings {
+    pub fn settings_dir() -> Result<PathBuf> {
+        if let Ok(dir) = std::env::var("COCOINDEX_CODE_DIR") {
+            return Ok(PathBuf::from(dir));
+        }
+
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+        Ok(home.join(".cocoindex_code"))
+    }
+
     pub fn load() -> Result<Self> {
         let path = Self::settings_path()?;
 
@@ -46,9 +56,7 @@ impl UserSettings {
     }
 
     fn settings_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
-        Ok(home.join(".cocoindex_code/settings.yml"))
+        Ok(Self::settings_dir()?.join("settings.yml"))
     }
 }
 

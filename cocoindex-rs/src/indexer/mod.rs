@@ -2,6 +2,7 @@ use std::path::Path;
 use walkdir::WalkDir;
 use crate::store::Store;
 use crate::provider::Provider;
+use crate::project::scoped_chunk_id;
 use crate::config::ProjectSettings;
 use crate::utils::{detect_language_with_overrides, PatternMatcher};
 use cocoindex_ops_text::split::{RecursiveChunker, RecursiveSplitConfig, RecursiveChunkConfig};
@@ -73,7 +74,7 @@ impl Indexer {
                 }
             }
 
-            println!("Indexing: {}", rel_path_str);
+            eprintln!("Indexing: {}", rel_path_str);
 
             // Delete old chunks for this file before inserting new ones
             self.store.delete_file_chunks(&rel_path_str).await?;
@@ -81,10 +82,11 @@ impl Indexer {
             // Detect language with overrides
             let language = detect_language_with_overrides(path, &self.settings.language_overrides);
 
+            let chunking = self.provider.chunking_profile();
             let config = RecursiveChunkConfig {
-                chunk_size: 2000,
-                min_chunk_size: Some(300),
-                chunk_overlap: Some(200),
+                chunk_size: chunking.chunk_size,
+                min_chunk_size: Some(chunking.min_chunk_size),
+                chunk_overlap: Some(chunking.chunk_overlap),
                 language: language.clone(),
             };
             let chunks = chunker.split(&content, config);
@@ -100,13 +102,11 @@ impl Indexer {
             let embeddings = self.provider.get_embeddings(texts).await?;
 
             for (i, (chunk, embedding)) in chunks.into_iter().zip(embeddings.into_iter()).enumerate() {
-                let id = format!("{}:{}", rel_path_str, i);
-                let chunk_content = &content[chunk.range.start..chunk.range.end];
+                let id = scoped_chunk_id(root, &rel_path_str, i);
                 self.store.save_chunk(
                     &id,
                     &rel_path_str,
                     language.as_deref(),
-                    chunk_content,
                     chunk.start.line as usize,
                     chunk.end.line as usize,
                     &hash,
@@ -123,7 +123,7 @@ impl Indexer {
             .collect();
 
         if !deleted_files.is_empty() {
-            println!("Cleaning up {} deleted file(s)...", deleted_files.len());
+            eprintln!("Cleaning up {} deleted file(s)...", deleted_files.len());
             self.store.delete_files(&deleted_files).await?;
         }
 
