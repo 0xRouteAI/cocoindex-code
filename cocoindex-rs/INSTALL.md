@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/0xRouteAI/cocoindex-code-rs/main/in
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0xRouteAI/cocoindex-code-rs/main/install.sh | VERSION=v0.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/0xRouteAI/cocoindex-code-rs/main/install.sh | VERSION=v0.1.15 bash
 ```
 
 ### Verify installation
@@ -199,7 +199,7 @@ curl -fsSL https://raw.githubusercontent.com/0xRouteAI/cocoindex-code-rs/main/in
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/0xRouteAI/cocoindex-code-rs/main/install.sh | VERSION=v0.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/0xRouteAI/cocoindex-code-rs/main/install.sh | VERSION=v0.1.15 bash
 ```
 
 ### 安装后验证
